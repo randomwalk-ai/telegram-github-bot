@@ -46,7 +46,7 @@ def index():
     return jsonify({"status": "running", "bot": "telegram-to-github-issues"}), 200
 
 
-@app.route("/webhook", methods=["POST"])
+@app.route("/api/webhook", methods=["POST"])
 def webhook():
     """Receive a Telegram update and create a GitHub issue from it."""
     update = request.get_json(force=True)
