@@ -1,2 +1,11 @@
-[tool.vercel]
+[
+project
+]
+name = "telegram-github-bot"
+version = "0.1.0"
+requires-python = ">=3.9"
+
+[
+tool.vercel
+]
 entrypoint = "bot:app"
