@@ -31,10 +31,15 @@ def send_telegram_message(chat_id, text, reply_markup=None):
 
 
 def get_github_repos():
-    """Fetch repos from GITHUB_REPOS environment variable."""
-    repos_env = os.environ.get("GITHUB_REPOS", "")
-    repos = [repo.strip() for repo in repos_env.split(",") if repo.strip()]
-    return repos
+    """Fetch all repos the GitHub token has access to."""
+    url = "https://api.github.com/user/repos"
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    resp = requests.get(url, headers=headers, params={"per_page": 20}, timeout=10)
+    resp.raise_for_status()
+    return [repo["full_name"] for repo in resp.json()]
 
 
 def create_github_issue(title, body, repo):
