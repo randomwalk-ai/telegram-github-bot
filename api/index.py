@@ -62,6 +62,16 @@ def webhook():
     first_name = user.get("first_name", "")
     text = message["text"]
 
+    
+    # Only process messages starting with @claude
+    if not text.startswith("@claude"):
+        send_telegram_message(
+            chat_id,
+            "⚠️ Please start your message with @claude to create an issue.\n\nExample:\n@claude add a footer to the homepage"
+        )
+        return jsonify({"ok": True}), 200
+
+
     # Build the GitHub issue
     issue_title = f"Telegram from @{username}: {text[:80]}"
     issue_body = (
