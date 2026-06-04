@@ -31,31 +31,10 @@ def send_telegram_message(chat_id, text, reply_markup=None):
 
 
 def get_github_repos():
-    """Fetch only repos that have Claude Code Action workflow installed."""
-    url = "https://api.github.com/user/repos"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-    resp = requests.get(url, headers=headers, params={"per_page": 50}, timeout=10)
-    resp.raise_for_status()
-    all_repos = [repo["full_name"] for repo in resp.json()]
-
-    # Filter only repos that have the Claude workflow file
-    claude_repos = []
-    for repo in all_repos:
-        try:
-            check_url = f"https://api.github.com/repos/{repo}/contents/.github/workflows"
-            check_resp = requests.get(check_url, headers=headers, timeout=10)
-            if check_resp.status_code == 200:
-                files = [f["name"] for f in check_resp.json()]
-                # Check if any workflow file mentions claude
-                if any("claude" in f.lower() for f in files):
-                    claude_repos.append(repo)
-        except requests.RequestException:
-            continue
-
-    return claude_repos
+    """Fetch repos from GITHUB_REPOS environment variable."""
+    repos_env = os.environ.get("GITHUB_REPOS", "")
+    repos = [repo.strip() for repo in repos_env.split(",") if repo.strip()]
+    return repos
 
 
 def create_github_issue(title, body, repo):
