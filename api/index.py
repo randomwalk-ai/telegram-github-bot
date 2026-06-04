@@ -31,15 +31,29 @@ def send_telegram_message(chat_id, text, reply_markup=None):
 
 
 def get_github_repos():
-    """Fetch all repos the GitHub token has access to."""
-    url = "https://api.github.com/user/repos"
+    """Fetch randomwalk-ai org repos that have Claude Code GitHub Action installed."""
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
-    resp = requests.get(url, headers=headers, params={"per_page": 20}, timeout=10)
+    # Use code search to find repos in the org with claude-code-action in workflows
+    search_url = "https://api.github.com/search/code"
+    params = {
+        "q": "anthropics/claude-code-action org:randomwalk-ai path:.github/workflows",
+        "per_page": 100,
+    }
+    resp = requests.get(search_url, headers=headers, params=params, timeout=10)
     resp.raise_for_status()
-    return [repo["full_name"] for repo in resp.json()]
+    items = resp.json().get("items", [])
+    # Deduplicate by repo full_name
+    seen = set()
+    repos = []
+    for item in items:
+        full_name = item["repository"]["full_name"]
+        if full_name not in seen:
+            seen.add(full_name)
+            repos.append(full_name)
+    return repos
 
 
 def create_github_issue(title, body, repo):
