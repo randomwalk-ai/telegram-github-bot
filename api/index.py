@@ -96,6 +96,7 @@ def webhook():
         return jsonify({"ok": True, "info": "skipped"}), 200
 
     chat_id = message["chat"]["id"]
+    group_name = message["chat"].get("title", "Unknown Group")
     user = message.get("from", {})
     user_id = user.get("id")
     username = user.get("username", "unknown")
@@ -126,7 +127,7 @@ def webhook():
         return jsonify({"ok": True}), 200
 
     # Store the message while user picks a repo
-    pending[user_id] = {"text": text, "username": username, "first_name": first_name, "chat_id": chat_id}
+    pending[user_id] = {"text": text, "username": username, "first_name": first_name, "chat_id": chat_id, "group_name": group_name}
 
     keyboard = build_repo_keyboard(repos)
     send_telegram_message(
@@ -162,13 +163,14 @@ def handle_callback(callback):
     username = user_state["username"]
     first_name = user_state["first_name"]
     chat_id = user_state["chat_id"]
+    group_name = user_state["group_name"]
 
     # Build the GitHub issue
     issue_title = f"Telegram from @{username}: {text[:80]}"
     issue_body = (
         f"**Requested by:** {first_name} (@{username})\n"
         f"**Telegram User ID:** `{user_id}`\n"
-        f"**Group Chat ID:** `{chat_id}`\n\n"
+        f"**Group:** {group_name} (`{chat_id}`)\n\n"
         f"---\n\n"
         f"{text}"
     )
