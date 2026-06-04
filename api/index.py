@@ -31,27 +31,33 @@ def send_telegram_message(chat_id, text, reply_markup=None):
 
 
 def get_github_repos():
-    """Fetch only repos that have Claude Code Action workflow installed."""
-    url = "https://api.github.com/user/repos"
+    """Fetch only org repos that have Claude Code Action workflow installed."""
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
-    resp = requests.get(url, headers=headers, params={"per_page": 50}, timeout=10)
-    resp.raise_for_status()
-    all_repos = [repo["full_name"] for repo in resp.json()]
 
-    # Filter only repos that have the Claude workflow file
+    # Fetch only org repos
+    all_repos = []
+    org_resp = requests.get("https://api.github.com/user/orgs",
+                            headers=headers, timeout=10)
+    if org_resp.status_code == 200:
+        for org in org_resp.json():
+            org_name = org["login"]
+            org_repos_resp = requests.get(
+                f"https://api.github.com/orgs/{org_name}/repos",
+                headers=headers, params={"per_page": 50}, timeout=10)
+            if org_repos_resp.status_code == 200:
+                all_repos += [repo["full_name"] for repo in org_repos_resp.json()]
+
+    # Filter only repos that have claude-issue-solver.yml
     claude_repos = []
     for repo in all_repos:
         try:
-            check_url = f"https://api.github.com/repos/{repo}/contents/.github/workflows"
+            check_url = f"https://api.github.com/repos/{repo}/contents/.github/workflows/claude-issue-solver.yml"
             check_resp = requests.get(check_url, headers=headers, timeout=10)
             if check_resp.status_code == 200:
-                files = [f["name"] for f in check_resp.json()]
-                # Check if any workflow file mentions claude
-                if any("claude" in f.lower() for f in files):
-                    claude_repos.append(repo)
+                claude_repos.append(repo)
         except requests.RequestException:
             continue
 
