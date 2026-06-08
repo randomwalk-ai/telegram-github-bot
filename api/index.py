@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
@@ -14,9 +15,14 @@ ALLOWED_GROUP_ID = int(os.environ.get("ALLOWED_GROUP_ID", "0"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# ── In-memory state: tracks repo selection per user ─────────────────
-# { user_id: { "repo": "owner/repo", "text": "original message" } }
+# ── In-memory state: tracks repo selection and clarification per user ─
+# { user_id: { "repo": "owner/repo", "text": "...", "awaiting_clarification": bool, ... } }
 pending = {}
+
+FILE_INDICATORS = [
+    ".tsx", ".ts", ".js", ".jsx", ".py", ".css", ".html", ".json", ".yml", ".yaml",
+    "src/", "app/", "components/", "pages/", "lib/", "utils/", "api/", "hooks/",
+]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -36,7 +42,6 @@ def get_github_repos():
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
-    # Use code search to find repos in the org with claude-code-action in workflows
     search_url = "https://api.github.com/search/code"
     params = {
         "q": "anthropics/claude-code-action org:randomwalk-ai path:.github/workflows",
@@ -45,7 +50,6 @@ def get_github_repos():
     resp = requests.get(search_url, headers=headers, params=params, timeout=10)
     resp.raise_for_status()
     items = resp.json().get("items", [])
-    # Deduplicate by repo full_name
     seen = set()
     repos = []
     for item in items:
@@ -73,6 +77,25 @@ def build_repo_keyboard(repos):
     """Build a Telegram inline keyboard from a list of repo names."""
     buttons = [[{"text": repo, "callback_data": f"repo:{repo}"}] for repo in repos]
     return {"inline_keyboard": buttons}
+
+
+def get_missing_details(text):
+    """Return clarifying questions for a vague @claude request. Empty list = specific enough."""
+    content = text.replace("@claude", "").strip().lower()
+    missing = []
+
+    if not any(ind in content for ind in FILE_INDICATORS):
+        missing.append("📁 *Which file?* Please provide the full path (e.g. `app/page.tsx`)")
+
+    has_line = bool(re.search(r"line\s*\d+|#l\d+|:\d+", content))
+    has_quote = '"' in content or "'" in content or "`" in content
+    if not has_line and not has_quote:
+        missing.append("📍 *Which exact location?* Give the line number or quote a few words from the text to change")
+
+    if len(content.split()) < 5:
+        missing.append("🎯 *What should the result look like?* Describe the expected change in more detail")
+
+    return missing
 
 
 # ── Routes ───────────────────────────────────────────────────────────
@@ -107,11 +130,16 @@ def webhook():
     if chat_id != ALLOWED_GROUP_ID:
         return jsonify({"ok": True, "info": "unauthorized – ignored"}), 200
 
-    # ── Layer 2: Only process messages starting with @claude ───────────
+    # ── Layer 2: Check if user is answering a clarification question ───
+    user_state = pending.get(user_id)
+    if user_state and user_state.get("awaiting_clarification"):
+        return handle_clarification_reply(user_id, user_state, text, chat_id)
+
+    # ── Layer 3: Only process messages starting with @claude ───────────
     if not text.startswith("@claude"):
         send_telegram_message(
             chat_id,
-            "⚠️ Please start your message with @claude to create an issue.\n\nExample:\n`@claude add a footer to the homepage`"
+            "⚠️ Please start your message with @claude to create an issue.\n\nExample:\n`@claude add a footer to the homepage`",
         )
         return jsonify({"ok": True}), 200
 
@@ -126,15 +154,55 @@ def webhook():
         send_telegram_message(chat_id, "❌ No accessible repos found.")
         return jsonify({"ok": True}), 200
 
-    # Store the message while user picks a repo
-    pending[user_id] = {"text": text, "username": username, "first_name": first_name, "chat_id": chat_id, "group_name": group_name}
+    pending[user_id] = {
+        "text": text,
+        "username": username,
+        "first_name": first_name,
+        "chat_id": chat_id,
+        "group_name": group_name,
+    }
 
     keyboard = build_repo_keyboard(repos)
     send_telegram_message(
         chat_id,
         f"📁 *{first_name}*, which repo should this issue go to?",
-        reply_markup=keyboard
+        reply_markup=keyboard,
     )
+
+    return jsonify({"ok": True}), 200
+
+
+def handle_clarification_reply(user_id, user_state, reply_text, chat_id):
+    """User replied to clarification questions — combine original + answers and create the issue."""
+    original_text = user_state["text"]
+    username = user_state["username"]
+    first_name = user_state["first_name"]
+    group_name = user_state["group_name"]
+    repo = user_state["repo"]
+
+    combined_text = f"{original_text}\n\nClarification provided: {reply_text}"
+
+    issue_title = f"Telegram from @{username}: {original_text[:80]}"
+    issue_body = (
+        f"**Requested by:** {first_name} (@{username})\n"
+        f"**Telegram User ID:** `{user_id}`\n"
+        f"**Group:** {group_name} (`{chat_id}`)\n\n"
+        f"---\n\n"
+        f"{combined_text}"
+    )
+
+    pending.pop(user_id, None)
+
+    try:
+        issue = create_github_issue(issue_title, issue_body, repo)
+        issue_url = issue.get("html_url", "(URL unavailable)")
+        send_telegram_message(
+            chat_id,
+            f"✅ Issue created in *{repo}*!\n[View on GitHub]({issue_url})",
+        )
+    except requests.RequestException as exc:
+        send_telegram_message(chat_id, f"❌ Failed to create issue: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
     return jsonify({"ok": True}), 200
 
@@ -145,17 +213,18 @@ def handle_callback(callback):
     user_id = user.get("id")
     data = callback.get("data", "")
 
-    # Answer the callback to remove the loading spinner on the button
-    requests.post(f"{TELEGRAM_API}/answerCallbackQuery",
-                  json={"callback_query_id": callback["id"]}, timeout=10)
+    requests.post(
+        f"{TELEGRAM_API}/answerCallbackQuery",
+        json={"callback_query_id": callback["id"]},
+        timeout=10,
+    )
 
     if not data.startswith("repo:"):
         return jsonify({"ok": True}), 200
 
     selected_repo = data[len("repo:"):]
 
-    # Retrieve the pending message for this user
-    user_state = pending.pop(user_id, None)
+    user_state = pending.get(user_id)
     if not user_state:
         return jsonify({"ok": True, "info": "no pending message"}), 200
 
@@ -165,7 +234,18 @@ def handle_callback(callback):
     chat_id = user_state["chat_id"]
     group_name = user_state["group_name"]
 
-    # Build the GitHub issue
+    # ── Check if the request is vague ────────────────────────────────
+    missing = get_missing_details(text)
+    if missing:
+        pending[user_id] = {**user_state, "repo": selected_repo, "awaiting_clarification": True}
+        questions = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(missing))
+        send_telegram_message(
+            chat_id,
+            f"🤔 *{first_name}*, I need a bit more info before creating the issue:\n\n{questions}\n\n_Just reply with the answers and I'll create it right away._",
+        )
+        return jsonify({"ok": True}), 200
+
+    # ── Request is specific enough — create the issue immediately ─────
     issue_title = f"Telegram from @{username}: {text[:80]}"
     issue_body = (
         f"**Requested by:** {first_name} (@{username})\n"
@@ -174,6 +254,8 @@ def handle_callback(callback):
         f"---\n\n"
         f"{text}"
     )
+
+    pending.pop(user_id, None)
 
     try:
         issue = create_github_issue(issue_title, issue_body, selected_repo)
