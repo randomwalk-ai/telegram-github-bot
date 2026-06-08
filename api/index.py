@@ -213,20 +213,7 @@ def webhook():
 
     content = text[len(CLAUDE_MENTION):].strip()
 
-    # ── Layer 5: Handle empty @claude message ─────────────────────────
-    if not content:
-        send_telegram_message(
-            chat_id,
-            f"👋 Hi *{first_name}*! You mentioned me but didn't include a message.\n\n"
-            f"Here's what you can do:\n"
-            f"• `{CLAUDE_MENTION} fix the login bug in app/auth.py line 32` — create a GitHub issue\n"
-            f"• `{CLAUDE_MENTION} what is a React hook?` — ask me a general question\n\n"
-            f"What do you need help with?",
-            f"_Or send `{CLAUDE_MENTION} /end` to cancel._",
-        )
-        return jsonify({"ok": True}), 200
-
-    # ── Layer 7: Detect general question — answer directly, no issue ──
+    # ── Layer 5: Detect general question — answer directly, no issue ──
     if not is_code_task(content.lower()):
         answer = None
         try:
@@ -242,11 +229,10 @@ def webhook():
                 f"🤖 That looks like a general question, *{first_name}*.\n\n"
                 f"I'm set up to create GitHub issues for code tasks. "
                 f"Try something like:\n`{CLAUDE_MENTION} fix the button in app/page.tsx line 42`"
-                f"_Or send `{CLAUDE_MENTION} /end` to cancel._",
             )
         return jsonify({"ok": True}), 200
 
-    # ── Layer 8: Code task — fetch repos and show selection keyboard ───
+    # ── Layer 6: Code task — fetch repos and show selection keyboard ───
     try:
         repos = get_github_repos()
     except requests.RequestException as exc:
