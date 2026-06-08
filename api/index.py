@@ -213,7 +213,18 @@ def webhook():
 
     content = text[len(CLAUDE_MENTION):].strip()
 
-    # ── Layer 5: Detect general question — answer directly, no issue ──
+    # ── Layer 5: Handle bare @claude with no message ───────────────────
+    if not content:
+        send_telegram_message(
+            chat_id,
+            f"👋 Hi *{first_name}*! You mentioned me but didn't include a message.\n\n"
+            f"I'm set up to create GitHub issues for code tasks.\n"
+            f"Try something like:\n`{CLAUDE_MENTION} fix the button in app/page.tsx line 42`"
+            f"_Or send `{CLAUDE_MENTION} /end` to cancel._",
+        )
+        return jsonify({"ok": True}), 200
+
+    # ── Layer 6: Detect general question — answer directly, no issue ──
     if not is_code_task(content.lower()):
         answer = None
         try:
@@ -229,6 +240,7 @@ def webhook():
                 f"🤖 That looks like a general question, *{first_name}*.\n\n"
                 f"I'm set up to create GitHub issues for code tasks. "
                 f"Try something like:\n`{CLAUDE_MENTION} fix the button in app/page.tsx line 42`"
+                f"_Or send `{CLAUDE_MENTION} /end` to cancel._",
             )
         return jsonify({"ok": True}), 200
 
