@@ -11,6 +11,7 @@ app = Flask(__name__)
 # ── Environment variables ────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ALLOWED_GROUP_ID = int(os.environ.get("ALLOWED_GROUP_ID", "0"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -26,10 +27,16 @@ FILE_INDICATORS = [
     "src/", "app/", "components/", "pages/", "lib/", "utils/", "api/", "hooks/",
 ]
 
-# Keywords that indicate the user wants to CREATE something new (not modify existing)
+# Keywords that indicate the user wants to CREATE something new
 CREATE_KEYWORDS = [
     "create", "add a new", "new page", "new file", "new component", "new route",
     "build a", "make a", "generate a", "scaffold",
+]
+
+# Keywords that indicate a code-related task (modify existing code)
+MODIFY_KEYWORDS = [
+    "change", "update", "fix", "rename", "highlight", "remove", "delete", "edit",
+    "modify", "refactor", "implement", "style", "replace", "move", "add",
 ]
 
 
@@ -87,9 +94,37 @@ def build_repo_keyboard(repos):
     return {"inline_keyboard": buttons}
 
 
+def is_code_task(content):
+    """Returns True if the message is a code-related task (create or modify)."""
+    has_file = any(ind in content for ind in FILE_INDICATORS)
+    has_create = any(kw in content for kw in CREATE_KEYWORDS)
+    has_modify = any(kw in content for kw in MODIFY_KEYWORDS)
+    return has_file or has_create or has_modify
+
+
 def is_create_request(content):
     """Returns True if the request is about creating a new file, page, or component."""
     return any(kw in content for kw in CREATE_KEYWORDS)
+
+
+def answer_with_claude(question):
+    """Call Anthropic API to answer a general question. Returns answer string."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 512,
+        "messages": [{"role": "user", "content": question}],
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()["content"][0]["text"]
 
 
 def get_missing_details(text):
@@ -98,9 +133,6 @@ def get_missing_details(text):
     missing = []
 
     if is_create_request(content):
-        # CREATE requests: only check that there's enough description of what to build.
-        # Don't ask "which file?" — the route/name is part of the request.
-        # A route pattern like /users or /dashboard counts as sufficient path info.
         has_route = bool(re.search(r"/\w+", content))
         words = content.split()
         if not has_route and len(words) < 6:
@@ -108,7 +140,6 @@ def get_missing_details(text):
         if len(words) < 5:
             missing.append("🎯 *What should it contain?* Describe the content or functionality of the new page/file")
     else:
-        # MODIFY requests: need file path, exact location, and what to change.
         has_file = any(ind in content for ind in FILE_INDICATORS) or bool(re.search(r"/\w+[\w/]*\.\w+", content))
         if not has_file:
             missing.append("📁 *Which file?* Please provide the full path (e.g. `app/page.tsx`)")
@@ -156,14 +187,23 @@ def webhook():
     if chat_id != ALLOWED_GROUP_ID:
         return jsonify({"ok": True, "info": "unauthorized – ignored"}), 200
 
-    # ── Layer 2: Check if user is answering a clarification question ───
+    # ── Layer 2: Handle /end command — cancel pending conversation ─────
+    stripped = text.strip()
+    command = stripped[len(CLAUDE_MENTION):].strip().lower() if stripped.startswith(CLAUDE_MENTION) else ""
+    if command in ("/end", "/cancel"):
+        if pending.pop(user_id, None):
+            send_telegram_message(chat_id, f"✅ Conversation cancelled, *{first_name}*. Start fresh anytime with `{CLAUDE_MENTION} <your request>`.")
+        else:
+            send_telegram_message(chat_id, f"Nothing to cancel, *{first_name}*.")
+        return jsonify({"ok": True}), 200
+
+    # ── Layer 3: Check if user is answering a clarification question ───
     user_state = pending.get(user_id)
     if user_state and user_state.get("awaiting_clarification"):
-        # Strip @claude prefix if present so it doesn't pollute the combined text
         reply = text[len(CLAUDE_MENTION):].strip() if text.startswith(CLAUDE_MENTION) else text
         return handle_clarification_reply(user_id, user_state, reply, chat_id)
 
-    # ── Layer 3: Only process messages starting with @claude ───────────
+    # ── Layer 4: Only process messages starting with @claude ──────────
     if not text.startswith(CLAUDE_MENTION):
         send_telegram_message(
             chat_id,
@@ -171,7 +211,28 @@ def webhook():
         )
         return jsonify({"ok": True}), 200
 
-    # ── Fetch repos and show selection keyboard ────────────────────────
+    content = text[len(CLAUDE_MENTION):].strip()
+
+    # ── Layer 5: Detect general question — answer directly, no issue ──
+    if not is_code_task(content.lower()):
+        answer = None
+        try:
+            answer = answer_with_claude(content)
+        except Exception:
+            pass
+
+        if answer:
+            send_telegram_message(chat_id, f"💬 *Claude says:*\n\n{answer}")
+        else:
+            send_telegram_message(
+                chat_id,
+                f"🤖 That looks like a general question, *{first_name}*.\n\n"
+                f"I'm set up to create GitHub issues for code tasks. "
+                f"Try something like:\n`{CLAUDE_MENTION} fix the button in app/page.tsx line 42`"
+            )
+        return jsonify({"ok": True}), 200
+
+    # ── Layer 6: Code task — fetch repos and show selection keyboard ───
     try:
         repos = get_github_repos()
     except requests.RequestException as exc:
@@ -208,10 +269,8 @@ def handle_clarification_reply(user_id, user_state, reply_text, chat_id):
     group_name = user_state["group_name"]
     repo = user_state["repo"]
 
-    # Accumulate answers into the original text
     combined_text = f"{original_text} {reply_text}"
 
-    # Still missing something? Ask again for only the remaining gaps
     still_missing = get_missing_details(combined_text)
     if still_missing:
         pending[user_id] = {**user_state, "text": combined_text}
@@ -222,7 +281,6 @@ def handle_clarification_reply(user_id, user_state, reply_text, chat_id):
         )
         return jsonify({"ok": True}), 200
 
-    # All details provided — create the issue
     issue_title = f"Telegram from @{username}: {original_text[:80]}"
     issue_body = (
         f"**Requested by:** {first_name} (@{username})\n"
@@ -275,18 +333,18 @@ def handle_callback(callback):
     chat_id = user_state["chat_id"]
     group_name = user_state["group_name"]
 
-    # ── Check if the request is vague ────────────────────────────────
     missing = get_missing_details(text)
     if missing:
         pending[user_id] = {**user_state, "repo": selected_repo, "awaiting_clarification": True}
         questions = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(missing))
         send_telegram_message(
             chat_id,
-            f"🤔 *{first_name}*, I need a bit more info before creating the issue:\n\n{questions}\n\n_Just reply with `@claude` followed by your answers and I'll create it right away._",
+            f"🤔 *{first_name}*, I need a bit more info before creating the issue:\n\n{questions}\n\n"
+            f"_Just reply with `{CLAUDE_MENTION}` followed by your answers and I'll create it right away._\n\n"
+            f"_Or send `{CLAUDE_MENTION} /end` to cancel._",
         )
         return jsonify({"ok": True}), 200
 
-    # ── Request is specific enough — create the issue immediately ─────
     issue_title = f"Telegram from @{username}: {text[:80]}"
     issue_body = (
         f"**Requested by:** {first_name} (@{username})\n"
