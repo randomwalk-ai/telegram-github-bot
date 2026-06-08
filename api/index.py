@@ -133,7 +133,9 @@ def webhook():
     # ── Layer 2: Check if user is answering a clarification question ───
     user_state = pending.get(user_id)
     if user_state and user_state.get("awaiting_clarification"):
-        return handle_clarification_reply(user_id, user_state, text, chat_id)
+        # Strip @claude prefix if present so it doesn't pollute the combined text
+        reply = text.lstrip("@claude").strip() if text.startswith("@claude") else text
+        return handle_clarification_reply(user_id, user_state, reply, chat_id)
 
     # ── Layer 3: Only process messages starting with @claude ───────────
     if not text.startswith("@claude"):
@@ -173,15 +175,28 @@ def webhook():
 
 
 def handle_clarification_reply(user_id, user_state, reply_text, chat_id):
-    """User replied to clarification questions — combine original + answers and create the issue."""
+    """User replied to clarification questions — check if complete, ask again if not."""
     original_text = user_state["text"]
     username = user_state["username"]
     first_name = user_state["first_name"]
     group_name = user_state["group_name"]
     repo = user_state["repo"]
 
-    combined_text = f"{original_text}\n\nClarification provided: {reply_text}"
+    # Accumulate answers into the original text
+    combined_text = f"{original_text} {reply_text}"
 
+    # Still missing something? Ask again for only the remaining gaps
+    still_missing = get_missing_details(combined_text)
+    if still_missing:
+        pending[user_id] = {**user_state, "text": combined_text}
+        questions = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(still_missing))
+        send_telegram_message(
+            chat_id,
+            f"🤔 Almost there, *{first_name}*! Still need:\n\n{questions}\n\n_Just reply with the remaining details._",
+        )
+        return jsonify({"ok": True}), 200
+
+    # All details provided — create the issue
     issue_title = f"Telegram from @{username}: {original_text[:80]}"
     issue_body = (
         f"**Requested by:** {first_name} (@{username})\n"
