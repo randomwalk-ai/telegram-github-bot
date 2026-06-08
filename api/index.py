@@ -220,7 +220,6 @@ def webhook():
             f"👋 Hi *{first_name}*! You mentioned me but didn't include a message.\n\n"
             f"I'm set up to create GitHub issues for code tasks.\n"
             f"Try something like:\n`{CLAUDE_MENTION} fix the button in app/page.tsx line 42`"
-            f"_Or send `{CLAUDE_MENTION} /end` to cancel._",
         )
         return jsonify({"ok": True}), 200
 
@@ -240,7 +239,6 @@ def webhook():
                 f"🤖 That looks like a general question, *{first_name}*.\n\n"
                 f"I'm set up to create GitHub issues for code tasks. "
                 f"Try something like:\n`{CLAUDE_MENTION} fix the button in app/page.tsx line 42`"
-                f"_Or send `{CLAUDE_MENTION} /end` to cancel._",
             )
         return jsonify({"ok": True}), 200
 
