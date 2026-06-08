@@ -26,6 +26,12 @@ FILE_INDICATORS = [
     "src/", "app/", "components/", "pages/", "lib/", "utils/", "api/", "hooks/",
 ]
 
+# Keywords that indicate the user wants to CREATE something new (not modify existing)
+CREATE_KEYWORDS = [
+    "create", "add a new", "new page", "new file", "new component", "new route",
+    "build a", "make a", "generate a", "scaffold",
+]
+
 
 # ── Helpers ──────────────────────────────────────────────────────────
 def send_telegram_message(chat_id, text, reply_markup=None):
@@ -81,21 +87,39 @@ def build_repo_keyboard(repos):
     return {"inline_keyboard": buttons}
 
 
+def is_create_request(content):
+    """Returns True if the request is about creating a new file, page, or component."""
+    return any(kw in content for kw in CREATE_KEYWORDS)
+
+
 def get_missing_details(text):
     """Return clarifying questions for a vague @claude request. Empty list = specific enough."""
     content = text.replace(CLAUDE_MENTION, "").strip().lower()
     missing = []
 
-    if not any(ind in content for ind in FILE_INDICATORS):
-        missing.append("📁 *Which file?* Please provide the full path (e.g. `app/page.tsx`)")
+    if is_create_request(content):
+        # CREATE requests: only check that there's enough description of what to build.
+        # Don't ask "which file?" — the route/name is part of the request.
+        # A route pattern like /users or /dashboard counts as sufficient path info.
+        has_route = bool(re.search(r"/\w+", content))
+        words = content.split()
+        if not has_route and len(words) < 6:
+            missing.append("📁 *Where should it go?* Provide the route or folder (e.g. `/users` or `app/users/page.tsx`)")
+        if len(words) < 5:
+            missing.append("🎯 *What should it contain?* Describe the content or functionality of the new page/file")
+    else:
+        # MODIFY requests: need file path, exact location, and what to change.
+        has_file = any(ind in content for ind in FILE_INDICATORS) or bool(re.search(r"/\w+[\w/]*\.\w+", content))
+        if not has_file:
+            missing.append("📁 *Which file?* Please provide the full path (e.g. `app/page.tsx`)")
 
-    has_line = bool(re.search(r"line\s*\d+|#l\d+|:\d+", content))
-    has_quote = '"' in content or "'" in content or "`" in content
-    if not has_line and not has_quote:
-        missing.append("📍 *Which exact location?* Give the line number or quote a few words from the text to change")
+        has_line = bool(re.search(r"line\s*\d+|#l\d+|:\d+", content))
+        has_quote = '"' in content or "'" in content or "`" in content
+        if not has_line and not has_quote:
+            missing.append("📍 *Which exact location?* Give the line number or quote a few words from the text to change")
 
-    if len(content.split()) < 5:
-        missing.append("🎯 *What should the result look like?* Describe the expected change in more detail")
+        if len(content.split()) < 5:
+            missing.append("🎯 *What should the result look like?* Describe the expected change in more detail")
 
     return missing
 
