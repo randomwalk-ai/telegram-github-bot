@@ -19,6 +19,8 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 # { user_id: { "repo": "owner/repo", "text": "...", "awaiting_clarification": bool, ... } }
 pending = {}
 
+CLAUDE_MENTION = "@claude"
+
 FILE_INDICATORS = [
     ".tsx", ".ts", ".js", ".jsx", ".py", ".css", ".html", ".json", ".yml", ".yaml",
     "src/", "app/", "components/", "pages/", "lib/", "utils/", "api/", "hooks/",
@@ -81,7 +83,7 @@ def build_repo_keyboard(repos):
 
 def get_missing_details(text):
     """Return clarifying questions for a vague @claude request. Empty list = specific enough."""
-    content = text.replace("@claude", "").strip().lower()
+    content = text.replace(CLAUDE_MENTION, "").strip().lower()
     missing = []
 
     if not any(ind in content for ind in FILE_INDICATORS):
@@ -134,14 +136,14 @@ def webhook():
     user_state = pending.get(user_id)
     if user_state and user_state.get("awaiting_clarification"):
         # Strip @claude prefix if present so it doesn't pollute the combined text
-        reply = text.lstrip("@claude").strip() if text.startswith("@claude") else text
+        reply = text[len(CLAUDE_MENTION):].strip() if text.startswith(CLAUDE_MENTION) else text
         return handle_clarification_reply(user_id, user_state, reply, chat_id)
 
     # ── Layer 3: Only process messages starting with @claude ───────────
-    if not text.startswith("@claude"):
+    if not text.startswith(CLAUDE_MENTION):
         send_telegram_message(
             chat_id,
-            "⚠️ Please start your message with @claude to create an issue.\n\nExample:\n`@claude add a footer to the homepage`",
+            f"⚠️ Please start your message with {CLAUDE_MENTION} to create an issue.\n\nExample:\n`{CLAUDE_MENTION} add a footer to the homepage`",
         )
         return jsonify({"ok": True}), 200
 
@@ -256,7 +258,7 @@ def handle_callback(callback):
         questions = "\n".join(f"{i + 1}. {q}" for i, q in enumerate(missing))
         send_telegram_message(
             chat_id,
-            f"🤔 *{first_name}*, I need a bit more info before creating the issue:\n\n{questions}\n\n_Just reply with the answers and I'll create it right away._",
+            f"🤔 *{first_name}*, I need a bit more info before creating the issue:\n\n{questions}\n\n_Just reply with `@claude` followed by your answers and I'll create it right away._",
         )
         return jsonify({"ok": True}), 200
 
