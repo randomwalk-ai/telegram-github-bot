@@ -1,5 +1,7 @@
 import os
 import re
+import threading
+import time
 import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
@@ -305,10 +307,16 @@ def handle_clarification_reply(user_id, user_state, reply_text, chat_id):
     try:
         issue = create_github_issue(issue_title, issue_body, repo)
         issue_url = issue.get("html_url", "(URL unavailable)")
+        issue_number = issue.get("number")
         send_telegram_message(
             chat_id,
-            f"✅ Issue created in *{repo}*!\n[View on GitHub]({issue_url})",
+            f"✅ Issue created in *{repo}*!\n[View on GitHub]({issue_url})\n\n_Waiting for Claude's reply…_",
         )
+        threading.Thread(
+            target=poll_for_claude_reply,
+            args=(repo, issue_number, chat_id),
+            daemon=True,
+        ).start()
     except requests.RequestException as exc:
         send_telegram_message(chat_id, f"❌ Failed to create issue: {exc}")
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -369,12 +377,91 @@ def handle_callback(callback):
     try:
         issue = create_github_issue(issue_title, issue_body, selected_repo)
         issue_url = issue.get("html_url", "(URL unavailable)")
+        issue_number = issue.get("number")
         send_telegram_message(
             chat_id,
-            f"✅ Issue created in *{selected_repo}*!\n[View on GitHub]({issue_url})",
+            f"✅ Issue created in *{selected_repo}*!\n[View on GitHub]({issue_url})\n\n_Waiting for Claude's reply…_",
         )
+        threading.Thread(
+            target=poll_for_claude_reply,
+            args=(selected_repo, issue_number, chat_id),
+            daemon=True,
+        ).start()
     except requests.RequestException as exc:
         send_telegram_message(chat_id, f"❌ Failed to create issue: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    return jsonify({"ok": True}), 200
+
+
+def poll_for_claude_reply(repo, issue_number, chat_id, interval=30, timeout=300):
+    """Poll GitHub issue comments until Claude responds, then send to Telegram."""
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        time.sleep(interval)
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            comments = resp.json()
+            for comment in comments:
+                login = comment.get("user", {}).get("login", "")
+                if login in ("github-actions[bot]", "claude[bot]"):
+                    body = comment.get("body", "").strip()
+                    issue_url = f"https://github.com/{repo}/issues/{issue_number}"
+                    msg = f"🤖 *Claude replied on [Issue #{issue_number}]({issue_url}):*\n\n{body}"
+                    if len(msg) > 4096:
+                        msg = msg[:4090] + "…"
+                    send_telegram_message(chat_id, msg)
+                    return
+        except Exception:
+            pass  # keep polling on transient errors
+
+
+@app.route("/api/github-webhook", methods=["POST"])
+def github_webhook():
+    """Receive GitHub issue comment events and forward Claude's replies to Telegram."""
+    event = request.headers.get("X-GitHub-Event", "")
+    if event != "issue_comment":
+        return jsonify({"ok": True, "info": "ignored"}), 200
+
+    payload = request.get_json(force=True)
+    action = payload.get("action", "")
+    if action != "created":
+        return jsonify({"ok": True, "info": "ignored"}), 200
+
+    comment = payload.get("comment", {})
+    commenter = comment.get("user", {}).get("login", "")
+    # Only forward comments from Claude Code Action bot
+    if commenter not in ("github-actions[bot]", "claude[bot]"):
+        return jsonify({"ok": True, "info": "not claude"}), 200
+
+    comment_body = comment.get("body", "").strip()
+    issue = payload.get("issue", {})
+    issue_body = issue.get("body", "")
+    issue_url = issue.get("html_url", "")
+    issue_number = issue.get("number", "")
+
+    # Extract chat_id from issue body line: **Group:** name (`-123456789`)
+    chat_id_match = re.search(r"\*\*Group:\*\*[^`]*`(-?\d+)`", issue_body)
+    if not chat_id_match:
+        return jsonify({"ok": True, "info": "no chat_id in issue"}), 200
+
+    chat_id = int(chat_id_match.group(1))
+
+    msg = f"🤖 *Claude replied on [Issue #{issue_number}]({issue_url}):*\n\n{comment_body}"
+    # Telegram message limit is 4096 chars
+    if len(msg) > 4096:
+        msg = msg[:4090] + "…"
+
+    try:
+        send_telegram_message(chat_id, msg)
+    except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
     return jsonify({"ok": True}), 200
