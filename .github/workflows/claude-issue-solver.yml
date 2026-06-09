@@ -1,0 +1,147 @@
+name: Claude Issue Solver
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: 'Base branch for the PR'
+        required: false
+        default: 'master'
+  issues:
+     types: [opened, assigned, labeled]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  claude-agent:
+    if: |
+      (github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'telegram') || contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude'))) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    env:
+      TARGET_BRANCH: ${{ inputs.base_branch != '' && inputs.base_branch || 'master' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Record existing claude branches
+        id: pre
+        run: |
+          git fetch origin
+          git ls-remote origin 'refs/heads/claude/*' | awk '{print $2}' | sed 's|refs/heads/||' > /tmp/pre-branches.txt
+
+      - name: Detect Telegram issue
+        id: telegram_check
+        run: |
+          LABELS='${{ toJson(github.event.issue.labels.*.name) }}'
+          if echo "$LABELS" | grep -q '"telegram"'; then
+            echo "is_telegram=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_telegram=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          base_branch: ${{ env.TARGET_BRANCH }}
+          claude_args: >-
+            --model claude-sonnet-4-6
+            --append-system-prompt "MANDATORY CLARIFICATION-FIRST PROTOCOL (overrides all default helpfulness). Before doing ANYTHING for an @claude request, follow the full protocol in CLAUDE.md. Hard rule: for a MODIFY request (change/update/fix/rename/highlight/remove/edit/color/style/text/font), if the user has NOT explicitly typed (1) an exact file path, (2) an exact location, and (3) an exact desired outcome, then the request is INCOMPLETE and you MUST NOT read, glob, grep, search, open, or guess any file, and you MUST NOT create a branch, write code, or commit. Instead post ONE comment asking only the missing items and STOP. Vague requests like 'change the text color', 'fix the button', 'update the heading' are ALWAYS incomplete — ask for the file, location, and target value. CREATE requests (create/add a new page/file/component) only need WHAT and WHERE; proceed with those. When in doubt, ASK — never guess."
+
+      - name: Detect new Claude branch
+        id: detect_branch
+        if: always()
+        run: |
+          git fetch origin
+          NEW_BRANCH=$(git ls-remote origin 'refs/heads/claude/*' | awk '{print $2}' | sed 's|refs/heads/||' | grep -vxFf /tmp/pre-branches.txt | head -1)
+          echo "new_branch=$NEW_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Send Telegram clarification notification
+        if: steps.detect_branch.outputs.new_branch == '' && steps.telegram_check.outputs.is_telegram == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+        run: |
+          ISSUE_URL="${{ github.event.issue.html_url }}"
+          ISSUE_TITLE="${{ github.event.issue.title }}"
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+
+          CLAUDE_COMMENT=$(gh api repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments \
+            --jq '[.[] | select(.user.login == "claude[bot]" or (.user.type == "Bot" and (.user.login | test("claude"))))] | last | .body' 2>/dev/null || echo "")
+
+          if [ -n "$CLAUDE_COMMENT" ]; then
+            SHORT_COMMENT=$(echo "$CLAUDE_COMMENT" | head -c 600)
+            MESSAGE="🤔 *Claude needs clarification*%0A%0A📌 Issue %23${ISSUE_NUMBER}: ${ISSUE_TITLE}%0A🔗 ${ISSUE_URL}%0A%0A💬 *Claude asked:*%0A${SHORT_COMMENT}"
+          else
+            MESSAGE="🤔 *Claude needs clarification*%0A%0A📌 Issue %23${ISSUE_NUMBER}: ${ISSUE_TITLE}%0A%0A🔗 ${ISSUE_URL}%0A%0AClaude asked for more details before proceeding."
+          fi
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown"
+
+      - name: Checkout Claude branch and build
+        id: build
+        if: steps.detect_branch.outputs.new_branch != ''
+        run: |
+          git checkout "${{ steps.detect_branch.outputs.new_branch }}"
+          pip install -r requirements.txt
+        continue-on-error: true
+
+      - name: Auto-create PR
+        if: steps.detect_branch.outputs.new_branch != '' && steps.build.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          NEW_BRANCH="${{ steps.detect_branch.outputs.new_branch }}"
+          gh pr create \
+            --head "$NEW_BRANCH" \
+            --base "${{ env.TARGET_BRANCH }}" \
+            --fill 2>/dev/null || echo "PR already exists"
+
+          if ${{ contains(github.event.issue.labels.*.name, 'telegram') }}; then
+            PR_NUMBER=$(gh pr view "$NEW_BRANCH" --json number -q '.number' 2>/dev/null)
+            if [ -n "$PR_NUMBER" ]; then
+              gh pr edit "$PR_NUMBER" --add-label "telegram" 2>/dev/null || true
+            fi
+          fi
+
+      - name: Comment on GitHub issue on build failure
+        if: steps.build.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          if [ -n "$ISSUE_NUMBER" ]; then
+            gh issue comment "$ISSUE_NUMBER" \
+              --body "❌ **Build failed** on branch \`${{ steps.detect_branch.outputs.new_branch }}\`. No PR was created. Please review the build errors."
+          fi
+
+      - name: Send Telegram failure notification
+        if: steps.build.outcome == 'failure' && steps.telegram_check.outputs.is_telegram == 'true'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_ID }}
+        run: |
+          ISSUE_URL="${{ github.event.issue.html_url }}"
+          BRANCH="${{ steps.detect_branch.outputs.new_branch }}"
+          MESSAGE="❌ *Build Failed — No PR Created*%0A%0A📌 Issue: ${ISSUE_URL}%0A🌿 Branch: ${BRANCH}%0A%0AThe build failed on the Claude-generated branch. Please fix the errors."
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown"
