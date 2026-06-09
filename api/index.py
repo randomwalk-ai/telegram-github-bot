@@ -50,6 +50,10 @@ def send_telegram_message(chat_id, text, reply_markup=None, parse_mode="Markdown
     if reply_markup:
         payload["reply_markup"] = reply_markup
     resp = requests.post(url, json=payload, timeout=10)
+    # If Telegram rejects the markdown (e.g. stray _ in file paths), retry as plain text
+    if not resp.ok and parse_mode:
+        payload.pop("parse_mode")
+        resp = requests.post(url, json=payload, timeout=10)
     resp.raise_for_status()
     return resp.json()
 
@@ -147,64 +151,68 @@ def answer_with_claude(question):
     return resp.json()["content"][0]["text"]
 
 
+_RE_BOLD = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _convert_body_line(line):
+    """Convert a single GitHub markdown line to Telegram-friendly text."""
+    stripped = line.strip()
+    if re.match(r"^[-*_]{3,}$", stripped):
+        return ""
+    m = re.match(r"^#{1,3}\s+(.+)", line)
+    if m:
+        return f"\n*{m.group(1).strip()}*"
+    m = re.match(r"^\s*-\s*\[x\]\s*(.+)", line, re.IGNORECASE)
+    if m:
+        return f"✔ {_RE_BOLD.sub(r'\1', m.group(1)).strip()}"
+    m = re.match(r"^\s*-\s*\[\s*\]\s*(.+)", line)
+    if m:
+        return f"◻ {_RE_BOLD.sub(r'\1', m.group(1)).strip()}"
+    return _RE_BOLD.sub(r"*\1*", line)
+
+
+def _build_link_row(first_line, comment_url):
+    """Extract PR / job / branch links from Claude's first comment line."""
+    pr = re.search(r"\[Create PR[^\]]*\]\(([^)]+)\)", first_line)
+    job = re.search(r"\[View job\]\(([^)]+)\)", first_line)
+    branch = re.search(r"\[`([^`]+)`\]\(([^)]+)\)", first_line)
+    parts = []
+    if pr:
+        parts.append(f"[🔀 Create PR]({pr.group(1)})")
+    if job:
+        parts.append(f"[📋 View job]({job.group(1)})")
+    if branch:
+        parts.append(f"[🌿 Branch]({branch.group(2)})")
+    return " · ".join(parts) if parts else f"[View on GitHub]({comment_url})"
+
+
 def format_claude_comment(body, first_name, issue_title, comment_url):
-    """Reformat Claude's raw GitHub comment into a clean Telegram message."""
-    # Time taken: "in 47s" or "in 1m 2s"
-    time_match = re.search(r"in (\d+m\s*\d+s|\d+s|\d+m)", body.split("\n")[0])
+    """Convert Claude's GitHub comment into a clean Telegram message — no content dropped."""
+    raw_lines = body.split("\n")
+    first_line = raw_lines[0] if raw_lines else ""
+
+    time_match = re.search(r"in (\d+m\s*\d+s|\d+s|\d+m)", first_line)
     time_str = f" in {time_match.group(1)}" if time_match else ""
 
-    # Completed todos
-    todos = re.findall(r"-\s*\[x\]\s*(.+)", body, re.IGNORECASE)
-
-    # Summary section
-    summary_match = re.search(r"###\s*Summary\s*\n+([\s\S]+?)(?:\n###|\Z)", body)
-    summary = summary_match.group(1).strip() if summary_match else ""
-
-    # PR link
-    pr_match = re.search(r"\[Create PR[^\]]*\]\(([^)]+)\)", body)
-
-    # Job link
-    job_match = re.search(r"\[View job\]\(([^)]+)\)", body)
-
-    # Branch name
-    branch_match = re.search(r"\[`([^`]+)`\]\(([^)]+)\)", body)
-
-    lines = []
-    lines.append(f"⚡ *Claude finished{time_str}, {first_name}!*")
-
-    # Strip the repo prefix from the issue title if present (e.g. "Telegram from @user: ...")
     display_title = re.sub(r"^Telegram from @\w+:\s*", "", issue_title).strip()
+
+    out = [f"⚡ *Claude finished{time_str}, {first_name}!*"]
     if display_title:
-        lines.append(f"📌 {display_title}")
+        out.append(f"📌 {display_title}")
+    out.append("")
 
-    if todos:
-        lines.append("")
-        for todo in todos:
-            # Strip stray markdown bold/italic from todo text
-            clean = re.sub(r"[*_`]", "", todo).strip()
-            lines.append(f"✔ {clean}")
+    for line in raw_lines[1:]:
+        out.append(_convert_body_line(line))
 
-    if summary:
-        lines.append("")
-        # Escape underscores so Telegram Markdown doesn't mis-parse them
-        safe_summary = summary.replace("_", "\\_")
-        lines.append(safe_summary)
+    while out and out[-1].strip() == "":
+        out.pop()
 
-    # Links row
-    link_parts = []
-    if pr_match:
-        link_parts.append(f"[🔀 Create PR]({pr_match.group(1)})")
-    if job_match:
-        link_parts.append(f"[📋 View job]({job_match.group(1)})")
-    if branch_match:
-        link_parts.append(f"[🌿 Branch]({branch_match.group(2)})")
-    if not link_parts:
-        link_parts.append(f"[View on GitHub]({comment_url})")
+    out.extend(["", _build_link_row(first_line, comment_url)])
 
-    lines.append("")
-    lines.append(" · ".join(link_parts))
-
-    return "\n".join(lines)
+    full = "\n".join(out)
+    if len(full) > 3800:
+        full = full[:3800] + f"\n\n...[Full response]({comment_url})"
+    return full
 
 
 def get_missing_details(text):
