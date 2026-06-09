@@ -27,28 +27,48 @@ FILE_INDICATORS = [
     "src/", "app/", "components/", "pages/", "lib/", "utils/", "api/", "hooks/",
 ]
 
-# Keywords that indicate the user wants to CREATE something new
 CREATE_KEYWORDS = [
     "create", "add a new", "new page", "new file", "new component", "new route",
     "build a", "make a", "generate a", "scaffold",
 ]
 
-# Keywords that indicate a code-related task (modify existing code)
 MODIFY_KEYWORDS = [
     "change", "update", "fix", "rename", "highlight", "remove", "delete", "edit",
     "modify", "refactor", "implement", "style", "replace", "move", "add",
 ]
 
+# Keywords that indicate Claude has finished its task (from Claude Code Action comment format)
+COMPLETION_KEYWORDS = ["claude finished", "task complete", "task completed", "completed the task"]
+
 
 # ── Helpers ──────────────────────────────────────────────────────────
-def send_telegram_message(chat_id, text, reply_markup=None):
+def send_telegram_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
     url = f"{TELEGRAM_API}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
     resp = requests.post(url, json=payload, timeout=10)
     resp.raise_for_status()
     return resp.json()
+
+
+def extract_chat_id_from_issue_body(body):
+    """Pull the Telegram chat_id embedded in the issue body we wrote."""
+    # Matches: **Group:** Some Name (`-1234567890`)
+    match = re.search(r"\*\*Group:\*\*[^\n]+\(`(-?\d+)`\)", body)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def extract_first_name_from_issue_body(body):
+    """Pull the requester first name embedded in the issue body."""
+    match = re.search(r"\*\*Requested by:\*\*\s+([^(\n]+)", body)
+    if match:
+        return match.group(1).strip()
+    return "there"
 
 
 def get_github_repos():
@@ -161,6 +181,71 @@ def index():
     return jsonify({"status": "running", "bot": "telegram-to-github-issues"}), 200
 
 
+@app.route("/api/github-webhook", methods=["POST"])
+def github_webhook():
+    """Receive org-level GitHub webhook events and forward Claude's replies to Telegram."""
+    event = request.headers.get("X-GitHub-Event", "")
+    payload = request.get_json(force=True) or {}
+
+    # Only care about issue comment events
+    if event != "issue_comment":
+        return jsonify({"ok": True}), 200
+
+    action = payload.get("action", "")
+    if action not in ("created", "edited"):
+        return jsonify({"ok": True}), 200
+
+    # Only forward comments made by the Claude bot
+    commenter_login = payload.get("comment", {}).get("user", {}).get("login", "").lower()
+    if "claude" not in commenter_login:
+        return jsonify({"ok": True}), 200
+
+    comment_body = payload.get("comment", {}).get("body", "")
+
+    # Only fire when Claude signals it has finished (not mid-run progress updates)
+    if not any(kw in comment_body.lower() for kw in COMPLETION_KEYWORDS):
+        return jsonify({"ok": True}), 200
+
+    # Extract the Telegram chat_id from the issue body we originally wrote — no DB needed
+    issue_body = payload.get("issue", {}).get("body", "")
+    chat_id = extract_chat_id_from_issue_body(issue_body)
+    if not chat_id:
+        return jsonify({"ok": True}), 200
+
+    first_name = extract_first_name_from_issue_body(issue_body)
+    comment_url = payload.get("comment", {}).get("html_url", "")
+    issue_title = payload.get("issue", {}).get("title", "your task")
+
+    # ── Message 1: header with markdown + GitHub link ─────────────────
+    try:
+        send_telegram_message(
+            chat_id,
+            f"✅ *Claude finished, {first_name}!*\n\n"
+            f"_{issue_title}_\n\n"
+            f"[View full response on GitHub]({comment_url})",
+        )
+    except Exception:
+        pass
+
+    # ── Message 2: Claude's actual comment body as plain text ─────────
+    # Send as plain text to avoid markdown conflicts with code blocks etc.
+    MAX_LEN = 3800
+    body_to_send = (
+        comment_body if len(comment_body) <= MAX_LEN
+        else comment_body[:MAX_LEN] + "\n\n...(truncated — see GitHub for full response)"
+    )
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": body_to_send},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+    return jsonify({"ok": True}), 200
+
+
 @app.route("/api/webhook", methods=["POST"])
 def webhook():
     update = request.get_json(force=True)
@@ -242,7 +327,7 @@ def webhook():
             )
         return jsonify({"ok": True}), 200
 
-    # ── Layer 6: Code task — fetch repos and show selection keyboard ───
+    # ── Layer 7: Code task — fetch repos and show selection keyboard ───
     try:
         repos = get_github_repos()
     except requests.RequestException as exc:
@@ -307,7 +392,9 @@ def handle_clarification_reply(user_id, user_state, reply_text, chat_id):
         issue_url = issue.get("html_url", "(URL unavailable)")
         send_telegram_message(
             chat_id,
-            f"✅ Issue created in *{repo}*!\n[View on GitHub]({issue_url})",
+            f"✅ Issue created in *{repo}*!\n"
+            f"⏳ Claude is working on it...\n\n"
+            f"[View on GitHub]({issue_url})",
         )
     except requests.RequestException as exc:
         send_telegram_message(chat_id, f"❌ Failed to create issue: {exc}")
@@ -371,7 +458,9 @@ def handle_callback(callback):
         issue_url = issue.get("html_url", "(URL unavailable)")
         send_telegram_message(
             chat_id,
-            f"✅ Issue created in *{selected_repo}*!\n[View on GitHub]({issue_url})",
+            f"✅ Issue created in *{selected_repo}*!\n"
+            f"⏳ Claude is working on it...\n\n"
+            f"[View on GitHub]({issue_url})",
         )
     except requests.RequestException as exc:
         send_telegram_message(chat_id, f"❌ Failed to create issue: {exc}")
