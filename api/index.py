@@ -147,6 +147,66 @@ def answer_with_claude(question):
     return resp.json()["content"][0]["text"]
 
 
+def format_claude_comment(body, first_name, issue_title, comment_url):
+    """Reformat Claude's raw GitHub comment into a clean Telegram message."""
+    # Time taken: "in 47s" or "in 1m 2s"
+    time_match = re.search(r"in (\d+m\s*\d+s|\d+s|\d+m)", body.split("\n")[0])
+    time_str = f" in {time_match.group(1)}" if time_match else ""
+
+    # Completed todos
+    todos = re.findall(r"-\s*\[x\]\s*(.+)", body, re.IGNORECASE)
+
+    # Summary section
+    summary_match = re.search(r"###\s*Summary\s*\n+([\s\S]+?)(?:\n###|\Z)", body)
+    summary = summary_match.group(1).strip() if summary_match else ""
+
+    # PR link
+    pr_match = re.search(r"\[Create PR[^\]]*\]\(([^)]+)\)", body)
+
+    # Job link
+    job_match = re.search(r"\[View job\]\(([^)]+)\)", body)
+
+    # Branch name
+    branch_match = re.search(r"\[`([^`]+)`\]\(([^)]+)\)", body)
+
+    lines = []
+    lines.append(f"⚡ *Claude finished{time_str}, {first_name}!*")
+
+    # Strip the repo prefix from the issue title if present (e.g. "Telegram from @user: ...")
+    display_title = re.sub(r"^Telegram from @\w+:\s*", "", issue_title).strip()
+    if display_title:
+        lines.append(f"📌 {display_title}")
+
+    if todos:
+        lines.append("")
+        for todo in todos:
+            # Strip stray markdown bold/italic from todo text
+            clean = re.sub(r"[*_`]", "", todo).strip()
+            lines.append(f"✔ {clean}")
+
+    if summary:
+        lines.append("")
+        # Escape underscores so Telegram Markdown doesn't mis-parse them
+        safe_summary = summary.replace("_", "\\_")
+        lines.append(safe_summary)
+
+    # Links row
+    link_parts = []
+    if pr_match:
+        link_parts.append(f"[🔀 Create PR]({pr_match.group(1)})")
+    if job_match:
+        link_parts.append(f"[📋 View job]({job_match.group(1)})")
+    if branch_match:
+        link_parts.append(f"[🌿 Branch]({branch_match.group(2)})")
+    if not link_parts:
+        link_parts.append(f"[View on GitHub]({comment_url})")
+
+    lines.append("")
+    lines.append(" · ".join(link_parts))
+
+    return "\n".join(lines)
+
+
 def get_missing_details(text):
     """Return clarifying questions for a vague @claude request. Empty list = specific enough."""
     content = text.replace(CLAUDE_MENTION, "").strip().lower()
@@ -216,30 +276,9 @@ def github_webhook():
     comment_url = payload.get("comment", {}).get("html_url", "")
     issue_title = payload.get("issue", {}).get("title", "your task")
 
-    # ── Message 1: header with markdown + GitHub link ─────────────────
+    formatted = format_claude_comment(comment_body, first_name, issue_title, comment_url)
     try:
-        send_telegram_message(
-            chat_id,
-            f"✅ *Claude finished, {first_name}!*\n\n"
-            f"_{issue_title}_\n\n"
-            f"[View full response on GitHub]({comment_url})",
-        )
-    except Exception:
-        pass
-
-    # ── Message 2: Claude's actual comment body as plain text ─────────
-    # Send as plain text to avoid markdown conflicts with code blocks etc.
-    MAX_LEN = 3800
-    body_to_send = (
-        comment_body if len(comment_body) <= MAX_LEN
-        else comment_body[:MAX_LEN] + "\n\n...(truncated — see GitHub for full response)"
-    )
-    try:
-        requests.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": body_to_send},
-            timeout=10,
-        )
+        send_telegram_message(chat_id, formatted)
     except Exception:
         pass
 
