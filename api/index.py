@@ -188,12 +188,13 @@ def format_claude_comment(body, first_name, issue_title, comment_url):
     raw_lines = body.split("\n")
     first_line = raw_lines[0] if raw_lines else ""
 
-    time_match = re.search(r"in (\d+m\s*\d+s|\d+s|\d+m)", first_line)
-    time_str = f" in {time_match.group(1)}" if time_match else ""
+    # Extract plain status text from first line (strip markdown links and trailing " — ..." parts)
+    status_text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", first_line)  # remove links
+    status_text = re.sub(r"\s*—\s*(View job|Create PR).*$", "", status_text, flags=re.IGNORECASE).strip()
 
     display_title = re.sub(r"^Telegram from @\w+:\s*", "", issue_title).strip()
 
-    out = [f"⚡ *Claude finished{time_str}, {first_name}!*"]
+    out = [f"⚡ *{status_text}, {first_name}!*" if status_text else f"⚡ *Claude replied, {first_name}!*"]
     if display_title:
         out.append(f"📌 {display_title}")
     out.append("")
