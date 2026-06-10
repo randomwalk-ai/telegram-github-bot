@@ -37,9 +37,6 @@ MODIFY_KEYWORDS = [
     "modify", "refactor", "implement", "style", "replace", "move", "add",
 ]
 
-# Keywords that indicate Claude has finished its task (from Claude Code Action comment format)
-COMPLETION_KEYWORDS = ["claude finished", "task complete", "task completed", "completed the task"]
-
 
 # ── Helpers ──────────────────────────────────────────────────────────
 def send_telegram_message(chat_id, text, reply_markup=None, parse_mode="Markdown"):
@@ -269,10 +266,6 @@ def github_webhook():
         return jsonify({"ok": True}), 200
 
     comment_body = payload.get("comment", {}).get("body", "")
-
-    # Only fire when Claude signals it has finished (not mid-run progress updates)
-    if not any(kw in comment_body.lower() for kw in COMPLETION_KEYWORDS):
-        return jsonify({"ok": True}), 200
 
     # Extract the Telegram chat_id from the issue body we originally wrote — no DB needed
     issue_body = payload.get("issue", {}).get("body", "")
